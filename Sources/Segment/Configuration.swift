@@ -6,10 +6,20 @@
 //
 
 import Foundation
-import JSONSafeEncoder
+import JSONSafeEncoding
 #if os(Linux)
 import FoundationNetworking
 #endif
+
+// MARK: - Custom AnonymousId generator
+/// Conform to this protocol to generate your own AnonymousID
+public protocol AnonymousIdGenerator: AnyObject, Codable {
+    /// Returns a new anonymousId.  Segment still manages storage and retrieval of the
+    /// current anonymousId and will call this method when new id's are needed.
+    ///
+    /// - Returns: A new anonymousId.
+    func newAnonymousId() -> String
+}
 
 // MARK: - Operating Mode
 /// Specifies the operating mode/context
@@ -20,6 +30,19 @@ public enum OperatingMode {
     case asynchronous
     
     static internal let defaultQueue = DispatchQueue(label: "com.segment.operatingModeQueue", qos: .utility)
+}
+
+// MARK: - Storage Mode
+/// Specifies the storage mode to be used for events
+public enum StorageMode {
+    /// Store events to disk (default).
+    case disk
+    /// Store events to disk in the given a directory URL.
+    case diskAtURL(URL)
+    /// Store events to memory and specify a max count before they roll off.
+    case memory(Int)
+    /// Some custom, user-defined storage mechanism conforming to `DataStore`.
+    case custom(any DataStore)
 }
 
 // MARK: - Internal Configuration
@@ -42,12 +65,14 @@ public class Configuration {
         var flushQueue: DispatchQueue = OperatingMode.defaultQueue
         var userAgent: String? = nil
         var jsonNonConformingNumberStrategy: JSONSafeEncoder.NonConformingFloatEncodingStrategy = .zero
+        var storageMode: StorageMode = .disk
+        var anonymousIdGenerator: AnonymousIdGenerator = SegmentAnonymousId()
     }
     
     internal var values: Values
 
     /// Initialize a configuration object to pass along to an Analytics instance.
-    /// 
+    ///
     /// - Parameter writeKey: Your Segment write key value
     public init(writeKey: String) {
         self.values = Values(writeKey: writeKey)
@@ -127,7 +152,7 @@ public extension Configuration {
     /// let config = Configuration(writeKey: "1234").defaultSettings(defaults)
     /// ```
     ///
-    /// - Parameter settings: 
+    /// - Parameter settings:
     /// - Returns: The current Configuration.
     @discardableResult
     func defaultSettings(_ settings: Settings?) -> Configuration {
@@ -231,6 +256,20 @@ public extension Configuration {
     func jsonNonConformingNumberStrategy(_ strategy: JSONSafeEncoder.NonConformingFloatEncodingStrategy) -> Configuration {
         values.jsonNonConformingNumberStrategy = strategy
         JSON.jsonNonConformingNumberStrategy = values.jsonNonConformingNumberStrategy
+        return self
+    }
+    
+    /// Specify the storage mode to use.  The default is `.disk`.
+    @discardableResult
+    func storageMode(_ mode: StorageMode) -> Configuration {
+        values.storageMode = mode
+        return self
+    }
+    
+    /// Specify a custom anonymousId generator.  The default is and instance of `SegmentAnonymousId`.
+    @discardableResult
+    func anonymousIdGenerator(_ generator: AnonymousIdGenerator) -> Configuration {
+        values.anonymousIdGenerator = generator
         return self
     }
 }

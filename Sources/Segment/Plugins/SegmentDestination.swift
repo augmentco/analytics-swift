@@ -16,6 +16,12 @@ import Sovran
 import FoundationNetworking
 #endif
 
+public class SegmentAnonymousId: AnonymousIdGenerator {
+    public func newAnonymousId() -> String {
+        return UUID().uuidString
+    }
+}
+
 public class SegmentDestination: DestinationPlugin, Subscriber, FlushCompletion {
     internal enum Constants: String {
         case integrationName = "Segment.io"
@@ -33,7 +39,8 @@ public class SegmentDestination: DestinationPlugin, Subscriber, FlushCompletion 
     }
 
     internal struct UploadTaskInfo {
-        let url: URL
+        let url: URL?
+        let data: Data?
         let task: URLSessionDataTask
         // set/used via an extension in iOSLifecycleMonitor.swift
         typealias CleanupClosure = () -> Void
@@ -80,7 +87,7 @@ public class SegmentDestination: DestinationPlugin, Subscriber, FlushCompletion 
          */
         // if customer specifies a different apiHost (ie: eu1.segmentapis.com) at app.segment.com ...
         if let host = segmentInfo?[Self.Constants.apiHost.rawValue] as? String, host.isEmpty == false {
-            if host != analytics.configuration.values.writeKey {
+            if host != analytics.configuration.values.apiHost {
                 analytics.configuration.values.apiHost = host
                 httpClient = HTTPClient(analytics: analytics)
             }
@@ -109,68 +116,174 @@ public class SegmentDestination: DestinationPlugin, Subscriber, FlushCompletion 
         guard let storage = self.storage else { return }
         // Send Event to File System
         storage.write(.events, value: event)
-        eventCount += 1
+        self._eventCount.withValue { count in
+            count += 1
+        }
     }
     
     public func flush() {
         // unused .. see flush(group:completion:)
     }
     
-    public func flush(group: DispatchGroup, completion: @escaping (DestinationPlugin) -> Void) {
+    public func flush(group: DispatchGroup) {
+        group.enter()
+        defer { group.leave() }
+        
         guard let storage = self.storage else { return }
         guard let analytics = self.analytics else { return }
-        guard let httpClient = self.httpClient else { return }
         
         // don't flush if analytics is disabled.
         guard analytics.enabled == true else { return }
-
-        // enter for the high level flush, allow us time to run through any existing files..
-        group.enter()
-        
-        // Read events from file system
-        guard let data = storage.read(Storage.Constants.events) else { group.leave(); return }
         
         eventCount = 0
         cleanupUploads()
         
+        let type = storage.dataStore.transactionType
+        let hasData = storage.dataStore.hasData
+        
         analytics.log(message: "Uploads in-progress: \(pendingUploads)")
         
         if pendingUploads == 0 {
-            for url in data {
-                // enter for this url we're going to kick off
-                group.enter()
-                analytics.log(message: "Processing Batch:\n\(url.lastPathComponent)")
-                // set up the task
-                let uploadTask = httpClient.startBatchUpload(writeKey: analytics.configuration.values.writeKey, batch: url) { (result) in
-                    switch result {
-                        case .success(_):
-                            storage.remove(file: url)
-                            self.cleanupUploads()
-                        default:
-                            break
-                    }
-                    
-                    analytics.log(message: "Processed: \(url.lastPathComponent)")
-                    // the upload we have here has just finished.
-                    // make sure it gets removed and it's cleanup() called rather
-                    // than waiting on the next flush to come around.
-                    self.cleanupUploads()
-                    // call the completion
-                    completion(self)
-                    // leave for the url we kicked off.
-                    group.leave()
-                }
-                // we have a legit upload in progress now, so add it to our list.
-                if let upload = uploadTask {
-                    add(uploadTask: UploadTaskInfo(url: url, task: upload))
-                }
+            if type == .file, hasData {
+                flushFiles(group: group)
+            } else if type == .data, hasData {
+                // we know it's a data-based transaction as opposed to file I/O
+                flushData(group: group)
             }
         } else {
             analytics.log(message: "Skipping processing; Uploads in progress.")
         }
+    }
+}
+
+extension SegmentDestination {
+    private func flushFiles(group: DispatchGroup) {
+        guard let storage = self.storage else { return }
+        guard let analytics = self.analytics else { return }
+        guard let httpClient = self.httpClient else { return }
+
+        // Cooperative release of allocated memory by URL instances (dataFiles).
+        autoreleasepool {
+            guard let files = storage.dataStore.fetch()?.dataFiles else { return }
+            
+            for url in files {
+                // Use the autorelease pool to ensure that unnecessary memory allocations
+                // are released after each iteration. If there is a large backlog of files
+                // to iterate, the host applications may crash due to OOM issues.
+                autoreleasepool {
+                    // enter for this url we're going to kick off
+                    group.enter()
+                    analytics.log(message: "Processing Batch:\n\(url.lastPathComponent)")
+                    
+                    // set up the task
+                    let uploadTask = httpClient.startBatchUpload(writeKey: analytics.configuration.values.writeKey, batch: url) { [weak self] result in
+                        defer {
+                            group.leave()
+                        }
+                        guard let self else { return }
+                        switch result {
+                        case .success(_):
+                            storage.remove(data: [url])
+                            cleanupUploads()
+                            
+                            // we don't want to retry events in a given batch when a 400
+                            // response for malformed JSON is returned
+                        case .failure(Segment.HTTPClientErrors.statusCode(code: 400)):
+                            storage.remove(data: [url])
+                            cleanupUploads()
+                        default:
+                            break
+                        }
+                        
+                        analytics.log(message: "Processed: \(url.lastPathComponent)")
+                        // the upload we have here has just finished.
+                        // make sure it gets removed and it's cleanup() called rather
+                        // than waiting on the next flush to come around.
+                        cleanupUploads()
+                    }
+                    
+                    // we have a legit upload in progress now, so add it to our list.
+                    if let upload = uploadTask {
+                        add(uploadTask: UploadTaskInfo(url: url, data: nil, task: upload))
+                    } else {
+                        // we couldn't get a task, so we need to leave the group or things will hang.
+                        group.leave()
+                    }
+                }
+            }
+        }
+    }
+    
+    private func flushData(group: DispatchGroup) {
+        // DO NOT CALL THIS FROM THE MAIN THREAD, IT BLOCKS!
+        // Don't make me add a check here; i'll be sad you didn't follow directions.
+        guard let storage = self.storage else { return }
+        guard let analytics = self.analytics else { return }
+        guard let httpClient = self.httpClient else { return }
         
-        // leave for the high level flush
-        group.leave()
+        let totalCount = storage.dataStore.count
+        var currentCount = 0
+        
+        guard totalCount > 0 else { return }
+        
+        while currentCount < totalCount {
+            // can't imagine why we wouldn't get data at this point, but if we don't, then split.
+            guard let eventData = storage.dataStore.fetch() else { return }
+            guard let data = eventData.data else { return }
+            guard let removable = eventData.removable else { return }
+            guard let dataCount = eventData.removable?.count else { return }
+            
+            currentCount += dataCount
+            
+            // enter for this data we're going to kick off
+            group.enter()
+            analytics.log(message: "Processing In-Memory Batch (size: \(data.count))")
+            
+            // we're already on a separate thread.
+            // lets let this task complete so we can get all the values out.
+            let semaphore = DispatchSemaphore(value: 0)
+            
+            // set up the task
+            let uploadTask = httpClient.startBatchUpload(writeKey: analytics.configuration.values.writeKey, data: data) { [weak self] result in
+                defer {
+                    // leave for the url we kicked off.
+                    group.leave()
+                    semaphore.signal()
+                }
+                
+                guard let self else { return }
+                switch result {
+                case .success(_):
+                    storage.remove(data: removable)
+                    cleanupUploads()
+                    
+                    // we don't want to retry events in a given batch when a 400
+                    // response for malformed JSON is returned
+                case .failure(Segment.HTTPClientErrors.statusCode(code: 400)):
+                    storage.remove(data: removable)
+                    cleanupUploads()
+                default:
+                    break
+                }
+                
+                analytics.log(message: "Processed In-Memory Batch (size: \(data.count))")
+                // the upload we have here has just finished.
+                // make sure it gets removed and it's cleanup() called rather
+                // than waiting on the next flush to come around.
+                cleanupUploads()
+            }
+            
+            // we have a legit upload in progress now, so add it to our list.
+            if let upload = uploadTask {
+                add(uploadTask: UploadTaskInfo(url: nil, data: data, task: upload))
+            } else {
+                // we couldn't get a task, so we need to leave the group or things will hang.
+                group.leave()
+                semaphore.signal()
+            }
+            
+            _ = semaphore.wait(timeout: .distantFuture)
+        }
     }
 }
 
